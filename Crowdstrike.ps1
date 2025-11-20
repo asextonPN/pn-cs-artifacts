@@ -1,3 +1,6 @@
+#!ps
+#!timeout=60000
+
 # Config
 
 $CrowdStrikeUrl     = "https://github.com/asextonPN/pn-cs-artifacts/releases/download/v1.0.0/FalconSensor_Windows.exe"
