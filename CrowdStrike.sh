@@ -16,57 +16,97 @@ MB_EXTS=(
   "com.malwarebytes.ncep.engine.sys.ext"
 )
 
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# Checks
+
 if [ "$(uname -s)" != "Darwin" ]; then
-  echo "Not macOS, exiting."
+  log "Not macOS, exiting."
   exit 0
 fi
 
-# Functions
+if [ "$(id -u)" -ne 0 ]; then
+  log "ERROR: This script must be run as root (uid 0)."
+  exit 1
+fi
 
-echo "[1/5] Removing Malwarebytes / ThreatDown system extensions (if present)..."
+# Remove ThreatDown
 
-for ext in "${MB_EXTS[@]}"; do
-  echo " - Trying to uninstall $ext..."
-  systemextensionsctl uninstall "$MB_TEAM_ID" "$ext" 2>/dev/null || true
-done
+log "[1/6] Removing Malwarebytes / ThreatDown system extensions..."
 
-echo "[2/5] Running vendor uninstall scripts (if present)..."
+if command -v systemextensionsctl >/dev/null 2>&1; then
+  for ext in "${MB_EXTS[@]}"; do
+    log " - Trying: systemextensionsctl uninstall $MB_TEAM_ID $ext"
+    if output=$(systemextensionsctl uninstall "$MB_TEAM_ID" "$ext" 2>&1); then
+      log "   -> uninstall command completed (reboot may be required)."
+      [ -n "$output" ] && log "   -> output: $output"
+    else
+      rc=$?
+      log "   -> uninstall command FAILED (exit $rc)."
+      [ -n "$output" ] && log "   -> output: $output"
+    fi
+  done
+
+  log " - Current systemextensionsctl list entries containing 'Malwarebytes' or 'THREATDOWN':"
+  systemextensionsctl list 2>/dev/null | grep -Ei "malwarebytes|threatdown" || log "   -> none found in list output."
+else
+  log "WARNING: systemextensionsctl not found; cannot manage system extensions on this macOS version."
+fi
+
+# Uninstall Scripts
+
+log "[2/6] Running Malwarebytes / ThreatDown vendor uninstall scripts..."
 
 if [ -f "/Library/Application Support/Malwarebytes/MBEndpointAgent/uninstall.sh" ]; then
-  echo " - Malwarebytes Endpoint Agent uninstall.sh"
-  chmod +x "/Library/Application Support/Malwarebytes/MBEndpointAgent/uninstall.sh"
-  "/Library/Application Support/Malwarebytes/MBEndpointAgent/uninstall.sh" --quiet || true
+  log " - Running Malwarebytes Endpoint Agent uninstall.sh"
+  chmod +x "/Library/Application Support/Malwarebytes/MBEndpointAgent/uninstall.sh" || true
+  "/Library/Application Support/Malwarebytes/MBEndpointAgent/uninstall.sh" --quiet || log "   -> uninstall.sh returned non-zero (continuing)."
 fi
 
 if [ -f "/Library/Application Support/THREATDOWN/EndpointAgent/uninstall.sh" ]; then
-  echo " - ThreatDown Endpoint Agent uninstall.sh"
-  chmod +x "/Library/Application Support/THREATDOWN/EndpointAgent/uninstall.sh"
-  "/Library/Application Support/THREATDOWN/EndpointAgent/uninstall.sh" --quiet || true
+  log " - Running ThreatDown Endpoint Agent uninstall.sh"
+  chmod +x "/Library/Application Support/THREATDOWN/EndpointAgent/uninstall.sh" || true
+  "/Library/Application Support/THREATDOWN/EndpointAgent/uninstall.sh" --quiet || log "   -> uninstall.sh returned non-zero (continuing)."
 fi
 
-echo " - Removing leftover Malwarebytes / ThreatDown files..."
-
+log " - Removing leftover Malwarebytes / ThreatDown files..."
 rm -rf "/Library/Application Support/Malwarebytes" 2>/dev/null || true
 rm -rf "/Library/Application Support/THREATDOWN" 2>/dev/null || true
 rm -rf /Library/Extensions/Malwarebytes* 2>/dev/null || true
 rm -rf /Applications/Malwarebytes* 2>/dev/null || true
 rm -rf /Applications/ThreatDown* 2>/dev/null || true
 
-echo "ThreatDown / Malwarebytes removal step complete (best effort)."
+log "ThreatDown / Malwarebytes removal step complete (best effort; reboot may still be required for extensions to fully unload)."
 
-echo "[3/5] Cleaning any existing Falcon install..."
+# Clean CrowdStrike
 
+log "[3/6] Cleaning any existing Falcon install..."
+
+FALCONCTL_OLD=""
 if [ -x "/Applications/Falcon.app/Contents/Resources/falconctl" ]; then
-  echo " - Found falconctl; attempting uninstall..."
-  /Applications/Falcon.app/Contents/Resources/falconctl uninstall -t 2>/dev/null || true
+  FALCONCTL_OLD="/Applications/Falcon.app/Contents/Resources/falconctl"
+elif [ -x "/Library/CS/falconctl" ]; then
+  FALCONCTL_OLD="/Library/CS/falconctl"
+fi
+
+if [ -n "$FALCONCTL_OLD" ]; then
+  log " - Found existing falconctl at $FALCONCTL_OLD; attempting uninstall..."
+  "$FALCONCTL_OLD" uninstall 2>&1 || log "   -> falconctl uninstall returned non-zero (continuing)."
 fi
 
 rm -rf /Applications/Falcon.app 2>/dev/null || true
 rm -rf /Library/CS 2>/dev/null || true
 
-echo "[4/5] Writing CrowdStrike CID plist..."
+# CID plist
 
-mkdir -p "$PLIST_DIR"
+log "[4/6] Writing CrowdStrike CID plist..."
+
+mkdir -p "$PLIST_DIR" 2>/dev/null || {
+  log "ERROR: Failed to create $PLIST_DIR"
+  exit 1
+}
 
 cat <<EOF > "$PLIST_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -79,44 +119,107 @@ cat <<EOF > "$PLIST_PATH"
 </plist>
 EOF
 
-chmod 644 "$PLIST_PATH"
-echo " - Plist created at $PLIST_PATH"
-echo " - Contents:"
-cat "$PLIST_PATH"
+chmod 644 "$PLIST_PATH" 2>/dev/null || log "WARNING: Failed to chmod 644 on $PLIST_PATH (continuing)."
 
-echo "[5/5] Downloading CrowdStrike installer..."
-curl -L "$CS_INSTALLER_URL" -o "$CS_INSTALLER_PATH"
-
-if [ $? -ne 0 ] || [ ! -f "$CS_INSTALLER_PATH" ]; then
-  echo "ERROR: Failed to download CrowdStrike installer."
+if [ ! -f "$PLIST_PATH" ]; then
+  log "ERROR: Plist file $PLIST_PATH was not created."
+  ls -ld "$PLIST_DIR" 2>/dev/null || true
   exit 1
 fi
 
-echo "Download OK: $CS_INSTALLER_PATH"
-echo "Installing CrowdStrike Falcon Sensor..."
+if command -v plutil >/dev/null 2>&1; then
+  if ! plutil -lint "$PLIST_PATH" >/dev/null 2>&1; then
+    log "ERROR: $PLIST_PATH is not a valid plist:"
+    cat "$PLIST_PATH" 2>/dev/null || true
+    exit 1
+  fi
+else
+  log "WARNING: plutil not found; skipping plist validation."
+fi
+
+log " - Plist created at $PLIST_PATH"
+log " - Plist contents:"
+cat "$PLIST_PATH" 2>/dev/null || log "WARNING: Could not read back $PLIST_PATH even though it exists."
+
+# CrowdStrike
+
+log "[5/6] Downloading CrowdStrike installer from GitHub..."
+
+curl -fL --retry 3 --retry-delay 5 "$CS_INSTALLER_URL" -o "$CS_INSTALLER_PATH"
+CURL_RC=$?
+
+if [ $CURL_RC -ne 0 ] || [ ! -f "$CS_INSTALLER_PATH" ]; then
+  log "ERROR: Failed to download CrowdStrike installer (curl exit $CURL_RC)."
+  ls -l "$CS_INSTALLER_PATH" 2>/dev/null || true
+  exit 1
+fi
+
+log "Download OK: $CS_INSTALLER_PATH"
+log "Installing CrowdStrike Falcon Sensor pkg..."
 
 installer -pkg "$CS_INSTALLER_PATH" -target /
 INSTALL_RC=$?
 
 if [ $INSTALL_RC -ne 0 ]; then
-  echo "ERROR: CrowdStrike installer exited with code $INSTALL_RC"
+  log "ERROR: CrowdStrike installer exited with code $INSTALL_RC"
   exit $INSTALL_RC
 fi
 
-echo "CrowdStrike pkg install reported success."
+log "CrowdStrike pkg install reported success."
 
+# License
+
+log "[6/6] Licensing and loading Falcon sensor..."
+
+FALCONCTL=""
 if [ -x "/Applications/Falcon.app/Contents/Resources/falconctl" ]; then
-  echo "Loading Falcon sensor..."
-  /Applications/Falcon.app/Contents/Resources/falconctl load 2>/dev/null || true
-
-  echo
-  echo "=== Falcon sensor info ==="
-  /Applications/Falcon.app/Contents/Resources/falconctl info 2>/dev/null || echo "falconctl info not available yet."
-  echo
-  echo "=== Falcon sensor stats ==="
-  /Applications/Falcon.app/Contents/Resources/falconctl stats 2>/dev/null || echo "falconctl stats not available yet."
-else
-  echo "WARNING: falconctl not found after install."
+  FALCONCTL="/Applications/Falcon.app/Contents/Resources/falconctl"
+elif [ -x "/Library/CS/falconctl" ]; then
+  FALCONCTL="/Library/CS/falconctl"
 fi
 
-echo "Done. Reboot may be required."
+if [ -z "$FALCONCTL" ]; then
+  log "ERROR: falconctl not found after install."
+  ls -R "/Applications/Falcon.app" 2>/dev/null || true
+  ls -R "/Library/CS" 2>/dev/null || true
+  exit 1
+fi
+
+log " - Using falconctl at: $FALCONCTL"
+
+log " - Applying license (CID)..."
+if output=$("$FALCONCTL" license "$CS_CID" 2>&1); then
+  log "   -> license command reported success."
+  [ -n "$output" ] && log "   -> output: $output"
+else
+  rc=$?
+  log "ERROR: falconctl license failed (exit $rc)."
+  [ -n "$output" ] && log "   -> output: $output"
+fi
+
+log " - Reloading Falcon sensor..."
+"$FALCONCTL" unload 2>/dev/null || true
+"$FALCONCTL" load 2>/dev/null || true
+
+log
+log "Falcon sensor info"
+"$FALCONCTL" info 2>&1 || log "falconctl info not available yet."
+log
+log "Falcon sensor stats"
+"$FALCONCTL" stats 2>&1 || log "falconctl stats not available yet."
+
+log
+log "Final checks"
+if [ -f "$PLIST_PATH" ]; then
+  log "Plist still present at $PLIST_PATH:"
+  cat "$PLIST_PATH" 2>/dev/null || true
+else
+  log "WARNING: $PLIST_PATH is missing after install and license steps."
+fi
+
+if command -v systemextensionsctl >/dev/null 2>&1; then
+  log "Current CrowdStrike / Malwarebytes system extensions:"
+  systemextensionsctl list 2>/dev/null | grep -Ei "crowdstrike|falcon|malwarebytes|threatdown" || log "   -> no matching entries."
+fi
+
+log "Done."
